@@ -15,9 +15,12 @@
 import json
 from collections.abc import Sequence
 
+from pydantic import BaseModel
+
 from beeai_framework.agents import AgentError, AgentExecutionConfig
 from beeai_framework.agents.base import BaseAgent
 from beeai_framework.agents.tool_calling.events import tool_calling_agent_event_types
+from beeai_framework.agents.tool_calling.prompts import ToolCallingAgentTaskPromptInput
 from beeai_framework.agents.tool_calling.types import (
     ToolCallingAgentRunOutput,
     ToolCallingAgentRunState,
@@ -40,6 +43,8 @@ from beeai_framework.utils.models import ModelLike, to_model
 
 __all__ = ["ToolCallingAgent"]
 
+from beeai_framework.utils.strings import to_json
+
 
 class ToolCallingAgent(BaseAgent[ToolCallingAgentRunOutput]):
     def __init__(
@@ -57,23 +62,35 @@ class ToolCallingAgent(BaseAgent[ToolCallingAgentRunOutput]):
         self._templates = to_model(ToolCallingAgentTemplates, templates or {})
 
     def run(
-        self, prompt: str | None = None, *, execution: AgentExecutionConfig | None = None
+        self,
+        prompt: str | None = None,
+        *,
+        context: str | None = None,
+        expected_output: str | type[BaseModel] | None = None,
+        execution: AgentExecutionConfig | None = None,
     ) -> Run[ToolCallingAgentRunOutput]:
         execution_config = execution or AgentExecutionConfig()
 
-        async def handler(context: RunContext) -> ToolCallingAgentRunOutput:
+        async def handler(run_context: RunContext) -> ToolCallingAgentRunOutput:
             state = ToolCallingAgentRunState(memory=UnconstrainedMemory(), result=None, iteration=0)
             await state.memory.add(SystemMessage(self._templates.system.render()))
             await state.memory.add_many(self.memory.messages)
+
             if prompt is not None:
-                await state.memory.add(UserMessage(prompt))
+                task_input = ToolCallingAgentTaskPromptInput(
+                    prompt=prompt,
+                    context=context,
+                    expected_output=expected_output if isinstance(expected_output, str) else None,
+                )
+                user_message = UserMessage(self._templates.task.render(task_input))
+                await state.memory.add(user_message)
 
             while state.result is None:
                 state.iteration += 1
                 if execution_config.max_iterations and state.iteration > execution_config.max_iterations:
                     raise AgentError(f"Agent was not able to resolve the task in {state.iteration} iterations.")
 
-                await context.emitter.emit(
+                await run_context.emitter.emit(
                     "start",
                     {"state": state.model_dump()},
                 )
@@ -87,11 +104,9 @@ class ToolCallingAgent(BaseAgent[ToolCallingAgentRunOutput]):
                         raise AgentError(f"Tool {tool_call.tool_name} does not exist!")
 
                     tool_input = json.loads(tool_call.args)
-                    print(tool_input)
                     tool_response = await tool.run(tool_input).context(
                         {"state": state.model_dump(), "tool_call_msg": tool_call}
                     )
-                    print(tool_response.get_text_content())
                     await state.memory.add(
                         ToolMessage(
                             MessageToolResultContent(
@@ -112,9 +127,24 @@ class ToolCallingAgent(BaseAgent[ToolCallingAgentRunOutput]):
                     )
 
                 if text_messages:
-                    state.result = AssistantMessage.from_chunks(text_messages)
+                    if (
+                        expected_output is not None
+                        and isinstance(expected_output, type)
+                        and issubclass(expected_output, BaseModel)
+                    ):
+                        structured = await self._llm.create_structure(
+                            schema=expected_output, messages=state.memory.messages
+                        )
+                        state.result = AssistantMessage(
+                            content=to_json(
+                                expected_output.model_validate(structured.object),
+                                indent=4,
+                            )
+                        )
+                    else:
+                        state.result = AssistantMessage.from_chunks(text_messages)
 
-                await context.emitter.emit(
+                await run_context.emitter.emit(
                     "success",
                     {"state": state.model_dump()},
                 )

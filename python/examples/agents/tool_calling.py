@@ -30,7 +30,7 @@ def process_agent_events(data: dict[str, Any], event: EventMeta) -> None:
     if event.name == "start":
         reader.write("Agent 🤖 (debug) : ", "starting new iteration")
     elif event.name == "success":
-        reader.write("Agent (debug) 🤖 : ", data["state"]["result"])
+        reader.write("Agent 🤖 (debug) : ", data["state"]["result"])
 
 
 async def main() -> None:

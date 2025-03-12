@@ -29,22 +29,48 @@ ToolCallingAgentSystemPrompt = PromptTemplate(
         functions={
             "formatDate": lambda data: datetime.now(tz=UTC).strftime("%A, %B %d, %Y at %I:%M:%S %p"),
         },
-        defaults={"role": "You are a helpful assistant.", "instructions": ""},
-        template="""{{role}}
+        defaults={"role": "A helpful AI assistant", "instructions": ""},
+        template="""
+Assume the role of {{role}}.
+
+{{#instructions}}
+Your instructions are:
+{{.}}
+{{/instructions}}
+
 When the user sends a message, figure out a solution and provide a final answer.
+You can use tools to improve your answers if available.
 
 # Best practices
 - Use markdown syntax to format code snippets, links, JSON, tables, images, and files.
 - When the message is unclear, ask for a clarification.
-- When the user wants to chitchat, always respond politely.
+- Do not refer to tools or tool outputs by name when responding.
 
-# Date and Time
 The current date and time is: {{formatDate}}
+""",
+    )
+)
 
-{{#instructions}}
-# Additional instructions
+
+class ToolCallingAgentTaskPromptInput(BaseModel):
+    prompt: str
+    context: str | None = None
+    expected_output: str | type[BaseModel] | None = None
+
+
+ToolCallingAgentTaskPrompt = PromptTemplate(
+    PromptTemplateInput(
+        schema=ToolCallingAgentTaskPromptInput,
+        template="""{{#context}}
+This is the context that you are working with:
 {{.}}
-{{/instructions}}
+{{/context}}
+
+{{#expected_output}}
+This is the expected criteria for your output: {{.}}
+{{/expected_output}}
+
+Your task: {{prompt}}
 """,
     )
 )

@@ -19,17 +19,16 @@ from collections.abc import Awaitable, Callable
 from inspect import isfunction
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, InstanceOf
+from pydantic import BaseModel, ConfigDict, InstanceOf
 
 from beeai_framework.agents.base import AnyAgent, BaseAgent
-from beeai_framework.agents.react import ReActAgent
-from beeai_framework.agents.react.types import ReActAgentRunOutput
+from beeai_framework.agents.tool_calling.agent import ToolCallingAgent
+from beeai_framework.agents.tool_calling.types import ToolCallingAgentRunOutput, ToolCallingAgentTemplates
 from beeai_framework.agents.types import (
     AgentExecutionConfig,
-    AgentMeta,
 )
 from beeai_framework.backend.chat import ChatModel
-from beeai_framework.backend.message import AnyMessage, AssistantMessage
+from beeai_framework.backend.message import AnyMessage
 from beeai_framework.context import Run
 from beeai_framework.memory import BaseMemory, ReadOnlyMemory, UnconstrainedMemory
 from beeai_framework.template import PromptTemplateInput
@@ -44,15 +43,26 @@ AgentFactory = Callable[[ReadOnlyMemory], AnyAgent | Awaitable[AnyAgent]]
 class AgentFactoryInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     name: str
+    role: str | None = None
     llm: ChatModel
     instructions: str | None = None
     tools: list[InstanceOf[AnyTool]] | None = None
     execution: AgentExecutionConfig | None = None
 
 
+class AgentWorkflowInput(BaseModel):
+    prompt: str
+    context: str | None = None
+    expected_output: str | type[BaseModel] | None = None
+
+    @classmethod
+    def from_message(cls, message: AnyMessage) -> Self:
+        return cls(prompt=message.text)
+
+
 class Schema(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    messages: list[AnyMessage] = Field(min_length=1)
+    inputs: list[InstanceOf[AgentWorkflowInput]]
+    context: str | None = None
     final_answer: str | None = None
     new_messages: list[AnyMessage] = []
 
@@ -61,8 +71,16 @@ class AgentWorkflow:
     def __init__(self, name: str = "AgentWorkflow") -> None:
         self.workflow = Workflow(name=name, schema=Schema)
 
-    def run(self, messages: list[AnyMessage]) -> Run[WorkflowRun[Any, Any]]:
-        return self.workflow.run(Schema(messages=messages))
+    def run(
+        self, messages: list[AnyMessage] | None = None, *, inputs: list[AgentWorkflowInput] | None = None
+    ) -> Run[WorkflowRun[Any, Any]]:
+        if not messages and not inputs:
+            raise ValueError("At least one of messages or inputs must be provided")
+
+        schema = Schema(
+            inputs=list(inputs) if inputs else [AgentWorkflowInput.from_message(msg) for msg in messages or []]
+        )
+        return self.workflow.run(schema)
 
     def del_agent(self, name: str) -> "AgentWorkflow":
         self.workflow.delete_step(name)
@@ -101,35 +119,36 @@ class AgentWorkflow:
         return self._add(name, agent if callable(agent) else self._create_factory(agent))
 
     def _create_factory(self, agent_input: AgentFactoryInput) -> AgentFactory:
-        def factory(memory: BaseMemory) -> ReActAgent:
+        def factory(memory: BaseMemory) -> ToolCallingAgent:
             def customizer(config: PromptTemplateInput[Any]) -> PromptTemplateInput[Any]:
                 new_config = config.model_copy()
                 new_config.defaults["instructions"] = agent_input.instructions or config.defaults.get("instructions")
+                new_config.defaults["role"] = agent_input.role or config.defaults.get("role")
                 return new_config
 
-            return ReActAgent(
+            templates = ToolCallingAgentTemplates()
+            templates.system = templates.system.fork(customizer=customizer)
+
+            return ToolCallingAgent(
                 llm=agent_input.llm,
                 tools=agent_input.tools or [],
                 memory=memory,
-                templates={"system": lambda template: template.fork(customizer=customizer)},
-                meta=AgentMeta(name=agent_input.name, description=agent_input.instructions or "", tools=[]),
-                execution=agent_input.execution,
+                templates=templates,
             )
 
         return factory
 
     def _add(self, name: str, factory: AgentFactory) -> Self:
         async def step(state: Schema) -> None:
-            memory = UnconstrainedMemory()
-            for message in state.messages + state.new_messages:
-                await memory.add(message)
+            agent = await ensure_async(factory)(UnconstrainedMemory())
+            input = state.inputs.pop(0)
+            run_output: ToolCallingAgentRunOutput = await agent.run(**input.model_dump())
 
-            agent = await ensure_async(factory)(memory.as_read_only())
-            run_output: ReActAgentRunOutput = await agent.run()
+            if state.inputs:
+                state.inputs[0].context = "\n\n".join([input.context or "", run_output.result.text])
+
             state.final_answer = run_output.result.text
-            state.new_messages.append(
-                AssistantMessage(f"Assistant Name: {name}\nAssistant Response: {run_output.result.text}")
-            )
+            state.new_messages.append(run_output.result)
 
         self.workflow.add_step(name, step)
         return self
