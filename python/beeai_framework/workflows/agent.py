@@ -64,7 +64,7 @@ class Schema(BaseModel):
     inputs: list[InstanceOf[AgentWorkflowInput]]
     context: str | None = None
     final_answer: str | None = None
-    new_messages: list[AnyMessage] = []
+    new_messages: list[InstanceOf[AnyMessage]] = []
 
 
 class AgentWorkflow:
